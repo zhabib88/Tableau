@@ -1,0 +1,41 @@
+import json
+import requests
+from tableau_api_lib import TableauServerConnection
+from urllib3 import disable_warnings, exceptions
+from datetime import datetime, timedelta
+
+# Suppress warning produced from opting to not verify certificate.
+disable_warnings(exceptions.InsecureRequestWarning)
+ 
+tableau_server_config = {
+        'my_env': {
+                'server': 'https://tableau-servername',
+                'api_version': '3.21',
+                'personal_access_token_name': '',
+                'personal_access_token_secret': '',
+                'site_name':'',
+                'site_url':''
+        }
+}
+ 
+conn = TableauServerConnection(config_json=tableau_server_config, env='my_env', ssl_verify=False)
+
+conn.sign_in()
+
+custom_graphql_query = """
+{
+  workbooks {
+    name
+  } 
+}
+"""
+
+print("abc")
+response = conn.metadata_graphql_query(query=custom_graphql_query)
+print(response)
+print("xyz")
+
+with open("graphql_response.json", "w") as file:
+    json.dump(obj = response.json(), fp=file)
+ 
+conn.sign_out

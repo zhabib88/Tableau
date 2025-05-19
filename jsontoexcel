@@ -1,0 +1,42 @@
+import json
+import pandas as pd
+
+# Load the JSON data from the file
+with open("graphql_response1.json", "r") as file:
+    data = json.load(file)
+
+# Extract relevant data from the JSON structure
+databases = data['data']['databasesConnection']['nodes']
+
+# Prepare lists to store rows and columns for the Excel file
+rows = []
+columns = ['Database ID', 'Database Name', 'Connection Type', 'Table Name', 'Table Full Name', 'Schema', 'Table ID', 'Column ID', 'Column Name']
+
+# Iterate through the databases and tables to extract information
+for db in databases:
+    db_id = db['id']
+    db_name = db['name']
+    connection_type = db['connectionType']
+    tables = db['tablesConnection']['nodes']
+    
+    for table in tables:
+        table_name = table['name']
+        table_full_name = table['fullName']
+        schema = table['schema']
+        table_id = table['id']
+        columns_data = table['columns']
+        
+        for column in columns_data:
+            column_id = column['id']
+            column_name = column['name']
+            
+            # Append the row with extracted information
+            rows.append([db_id, db_name, connection_type, table_name, table_full_name, schema, table_id, column_id, column_name])
+
+# Create a DataFrame from the rows and columns
+df = pd.DataFrame(rows, columns=columns)
+
+# Save the DataFrame to an Excel file
+df.to_excel("graphql_response1.xlsx", index=False)
+
+print("JSON data has been successfully converted to Excel format.")

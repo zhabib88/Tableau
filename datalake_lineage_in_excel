@@ -1,0 +1,216 @@
+# get all the datalake lineage information in summary and details in chunks (50 tables information in one excel sheets)
+
+import concurrent.futures
+import logging
+from tableau_api_lib import TableauServerConnection
+from urllib3 import disable_warnings, exceptions
+import pandas as pd
+from datetime import datetime
+from collections import defaultdict
+
+disable_warnings(exceptions.InsecureRequestWarning)
+
+# Setup logging
+log_filename = f"tableau_export_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logging.info("Script started.")
+
+# Tableau connection config
+tableau_server_config = {
+    'my_env': {
+        'server': 'https://server name',
+        'api_version': '3.21',
+        'personal_access_token_name': '',
+        'personal_access_token_secret': '',
+        'site_name': '',
+        'site_url': ''
+    }
+}
+
+try:
+    conn = TableauServerConnection(config_json=tableau_server_config, env='my_env', ssl_verify=False)
+    conn.sign_in()
+    logging.info("Signed in to Tableau server.")
+except Exception as e:
+    logging.error(f"Failed to sign in to Tableau: {e}")
+    raise
+
+# Step 1: Get tables
+tables = []
+has_next_page = True
+cursor = None
+
+while has_next_page and len(tables) < 400:
+    after_clause = f', after: "{cursor}"' if cursor else ''
+    query_tables = f"""
+    {{
+      databasesConnection(filter: {{connectionType: "oracle", name: "host name"}}) {{
+        nodes {{
+          tablesConnection(first: 50{after_clause}) {{
+            nodes {{
+              id
+              name
+            }}
+            pageInfo {{
+              endCursor
+              hasNextPage
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    try:
+        response = conn.metadata_graphql_query(query=query_tables)
+        data = response.json().get('data')
+        if data and 'databasesConnection' in data:
+            nodes = data['databasesConnection'].get('nodes', [])
+            if nodes and 'tablesConnection' in nodes[0]:
+                connection = nodes[0]['tablesConnection']
+                tables.extend(connection.get('nodes', []))
+                page_info = connection.get('pageInfo', {})
+                cursor = page_info.get('endCursor')
+                has_next_page = page_info.get('hasNextPage', False)
+            else:
+                break
+        else:
+            break
+    except Exception as e:
+        logging.error(f"Error during pagination: {e}")
+        break
+
+logging.info(f"Retrieved {len(tables)} tables.")
+
+# Step 2: Fetch downstream details
+def fetch_details_for_table(table):
+    table_id = table['id']
+    table_name = table['name']
+    detail_queries = {
+        "Dashboards": "downstreamDashboards { name }",
+        "Workbooks": "downstreamWorkbooks { name }",
+        "Sheets": "downstreamSheets { name }",
+        "Flows": "downstreamFlows { name }",
+        "Owners": "downstreamOwners { name email }"
+    }
+    details = []
+    for label, fields in detail_queries.items():
+        query = f"""
+        {{
+          databasesConnection(filter: {{connectionType: "oracle", name: "pdlhadw_low"}}) {{
+            nodes {{
+              tables(filter: {{id: "{table_id}"}}) {{
+                {fields}
+              }}
+            }}
+          }}
+        }}
+        """
+        try:
+            r = conn.metadata_graphql_query(query=query)
+            data = r.json().get('data')
+            if data and 'databasesConnection' in data:
+                nodes = data['databasesConnection'].get('nodes', [])
+                if nodes and 'tables' in nodes[0]:
+                    table_data = nodes[0]['tables'][0]
+                    items = table_data.get(f"downstream{label}", [])
+                    for item in items:
+                        name = item.get('name', '')
+                        if label == "Owners":
+                            email = item.get('email', '')
+                            name = f"{name} ({email})"
+                        details.append({
+                            "table_id": table_id,
+                            "table_name": table_name,
+                            "downstreamtype": label,
+                            "name": name
+                        })
+        except Exception as e:
+            logging.warning(f"Failed to fetch {label} for table {table_name}: {e}")
+    return details
+# Step 3: Collect all details
+all_details = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    future_to_table = {executor.submit(fetch_details_for_table, table): table for table in tables}
+    for future in concurrent.futures.as_completed(future_to_table):
+        try:
+            result = future.result()
+            all_details.extend(result)
+            if result:
+                logging.info(f"Fetched details for table: {result[0]['table_name']}")
+        except Exception as exc:
+            table = future_to_table[future]
+            logging.error(f"Error fetching details for table {table['name']}: {exc}")
+
+conn.sign_out()
+logging.info("Signed out from Tableau.")
+
+# Step 4: Export to Excel in batches
+def export_to_excel(details, file_index):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_file = f"table_details_{timestamp}_batch_{file_index}.xlsx"
+    try:
+        sheet_names = set()
+        summary_data = []
+        table_sheets = []
+
+        for table_id in set(d['table_id'] for d in details):
+            table_details = [d for d in details if d['table_id'] == table_id]
+            table_name = table_details[0]['table_name'][:25]
+            sheet_name = f"{table_name}"[:31]
+
+            base_name = sheet_name
+            suffix = 1
+            while sheet_name.lower() in sheet_names:
+                sheet_name = f"{base_name}_{suffix}"[:31]
+                suffix += 1
+
+            sheet_names.add(sheet_name.lower())
+
+            summary_data.append({
+                "table_name": sheet_name,
+                "table_id": table_id,
+                "Dashboards": sum(1 for d in table_details if d['downstreamtype'] == 'Dashboards'),
+                "Workbooks": sum(1 for d in table_details if d['downstreamtype'] == 'Workbooks'),
+                "Sheets": sum(1 for d in table_details if d['downstreamtype'] == 'Sheets'),
+                "Flows": sum(1 for d in table_details if d['downstreamtype'] == 'Flows'),
+                "Owners": sum(1 for d in table_details if d['downstreamtype'] == 'Owners')
+            })
+
+            table_sheets.append((sheet_name, pd.DataFrame(table_details)))
+
+        # Write to Excel
+        writer = pd.ExcelWriter(excel_file, engine='xlsxwriter')
+
+        # Write Sheet_Index first
+        df_index = pd.DataFrame(summary_data, columns=[
+            "table_name", "table_id", "Dashboards", "Workbooks", "Sheets", "Flows", "Owners"
+        ])
+        df_index.to_excel(writer, sheet_name="Sheet_Index", index=False)
+
+        # Write all other sheets
+        for sheet_name, df in table_sheets:
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        writer.close()
+        logging.info(f"Exported batch {file_index} to {excel_file}")
+    except Exception as e:
+        logging.error(f"Failed to export batch {file_index}: {e}")
+
+
+# Step 5: Batch and export
+batch_size = 50
+table_groups = defaultdict(list)
+for row in all_details:
+    table_groups[row['table_id']].append(row)
+
+table_ids = list(table_groups.keys())
+for i in range(0, len(table_ids), batch_size):
+    batch_table_ids = table_ids[i:i + batch_size]
+    batch_rows = [row for table_id in batch_table_ids for row in table_groups[table_id]]
+    export_to_excel(batch_rows, i // batch_size + 1)
+
+logging.info("Script completed.")

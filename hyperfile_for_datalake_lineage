@@ -1,0 +1,200 @@
+# full datalake lineage details and summary in .hyper file
+
+from tableau_api_lib import TableauServerConnection
+from tableauhyperapi import HyperProcess, Connection, Telemetry, TableDefinition, SqlType, Inserter, CreateMode
+import concurrent.futures
+import logging
+from urllib3 import disable_warnings, exceptions
+from datetime import datetime
+
+disable_warnings(exceptions.InsecureRequestWarning)
+
+# Setup logging
+log_filename = f"tableau_export_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(filename=log_filename, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.info("Script started.")
+
+# Tableau connection config
+tableau_server_config = {
+    'my_env': {
+        'server': 'https://servername',
+        'api_version': '3.21',
+        'personal_access_token_name': '',
+        'personal_access_token_secret': '',
+        'site_name': '',
+        'site_url': ''
+    }
+}
+
+try:
+    conn = TableauServerConnection(config_json=tableau_server_config, env='my_env', ssl_verify=False)
+    conn.sign_in()
+    logging.info("Signed in to Tableau server.")
+except Exception as e:
+    logging.error(f"Failed to sign in to Tableau: {e}")
+    raise
+
+# Step 1: Get tables
+tables = []
+has_next_page = True
+cursor = None
+
+while has_next_page and len(tables) < 400:
+    after_clause = f', after: "{cursor}"' if cursor else ''
+    query_tables = f"""
+    {{
+      databasesConnection(filter: {{connectionType: "oracle", name: "enter host name"}}) {{
+        nodes {{
+          tablesConnection(first: 50{after_clause}) {{
+            nodes {{
+              id
+              name
+            }}
+            pageInfo {{
+              endCursor
+              hasNextPage
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    try:
+        response = conn.metadata_graphql_query(query=query_tables)
+        data = response.json().get('data')
+        if data and 'databasesConnection' in data:
+            nodes = data['databasesConnection'].get('nodes', [])
+            if nodes and 'tablesConnection' in nodes[0]:
+                connection = nodes[0]['tablesConnection']
+                tables.extend(connection.get('nodes', []))
+                page_info = connection.get('pageInfo', {})
+                cursor = page_info.get('endCursor')
+                has_next_page = page_info.get('hasNextPage', False)
+            else:
+                break
+        else:
+            break
+    except Exception as e:
+        logging.error(f"Error during pagination: {e}")
+        break
+
+logging.info(f"Retrieved {len(tables)} tables.")
+
+# Step 2: Fetch downstream details
+def fetch_details_for_table(table):
+    table_id = table['id']
+    table_name = table['name']
+    detail_queries = {
+        "Dashboards": "downstreamDashboards { name }",
+        "Workbooks": "downstreamWorkbooks { name }",
+        "Sheets": "downstreamSheets { name }",
+        "Flows": "downstreamFlows { name }",
+        "Owners": "downstreamOwners { name email }"
+    }
+    details = []
+    for label, fields in detail_queries.items():
+        query = f"""
+        {{
+          databasesConnection(filter: {{connectionType: "oracle", name: "pdlhadw_low"}}) {{
+            nodes {{
+              tables(filter: {{id: "{table_id}"}}) {{
+                {fields}
+              }}
+            }}
+          }}
+        }}
+        """
+        try:
+            r = conn.metadata_graphql_query(query=query)
+            data = r.json().get('data')
+            if data and 'databasesConnection' in data:
+                nodes = data['databasesConnection'].get('nodes', [])
+                if nodes and 'tables' in nodes[0]:
+                    table_data = nodes[0]['tables'][0]
+                    items = table_data.get(f"downstream{label}", [])
+                    for item in items:
+                        name = item.get('name', '')
+                        if label == "Owners":
+                            email = item.get('email', '')
+                            name = f"{name} ({email})"
+                        details.append({
+                            "table_id": table_id,
+                            "table_name": table_name,
+                            "downstreamtype": label,
+                            "name": name
+                        })
+        except Exception as e:
+            logging.warning(f"Failed to fetch {label} for table {table_name}: {e}")
+    return details
+
+# Step 3: Collect all details
+all_details = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    future_to_table = {executor.submit(fetch_details_for_table, table): table for table in tables}
+    for future in concurrent.futures.as_completed(future_to_table):
+        try:
+            result = future.result()
+            all_details.extend(result)
+            if result:
+                logging.info(f"Fetched details for table: {result[0]['table_name']}")
+        except Exception as exc:
+            table = future_to_table[future]
+            logging.error(f"Error fetching details for table {table['name']}: {exc}")
+
+conn.sign_out()
+logging.info("Signed out from Tableau.")
+
+# Step 4: Create Hyper file with summary statistics
+hyper_file = f"table_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.hyper"
+
+with HyperProcess(telemetry=Telemetry.SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+    with Connection(endpoint=hyper.endpoint, database=hyper_file, create_mode=CreateMode.CREATE_AND_REPLACE) as connection:
+        connection.catalog.create_schema('Extract')
+
+        # Table 1: Detailed downstream metadata
+        table_details_definition = TableDefinition(table_name='Extract.TableDetails')
+        table_details_definition.add_column('table_id', SqlType.text())
+        table_details_definition.add_column('table_name', SqlType.text())
+        table_details_definition.add_column('downstreamtype', SqlType.text())
+        table_details_definition.add_column('name', SqlType.text())
+        connection.catalog.create_table(table_details_definition)
+
+        with Inserter(connection, table_details_definition) as inserter:
+            inserter.add_rows([
+                [d['table_id'], d['table_name'], d['downstreamtype'], d['name']]
+                for d in all_details
+            ])
+            inserter.execute()
+
+        # Table 2: Summary statistics
+        summary_definition = TableDefinition(table_name='Extract.SummaryStatistics')
+        summary_definition.add_column('table_id', SqlType.text())
+        summary_definition.add_column('table_name', SqlType.text())
+        summary_definition.add_column('Dashboards', SqlType.int())
+        summary_definition.add_column('Workbooks', SqlType.int())
+        summary_definition.add_column('Sheets', SqlType.int())
+        summary_definition.add_column('Flows', SqlType.int())
+        summary_definition.add_column('Owners', SqlType.int())
+        connection.catalog.create_table(summary_definition)
+
+        summary_data = []
+        table_ids = set(d['table_id'] for d in all_details)
+        for table_id in table_ids:
+            table_rows = [d for d in all_details if d['table_id'] == table_id]
+            table_name = table_rows[0]['table_name']
+            summary_data.append([
+                table_id,
+                table_name,
+                sum(1 for d in table_rows if d['downstreamtype'] == 'Dashboards'),
+                sum(1 for d in table_rows if d['downstreamtype'] == 'Workbooks'),
+                sum(1 for d in table_rows if d['downstreamtype'] == 'Sheets'),
+                sum(1 for d in table_rows if d['downstreamtype'] == 'Flows'),
+                sum(1 for d in table_rows if d['downstreamtype'] == 'Owners')
+            ])
+
+        with Inserter(connection, summary_definition) as inserter:
+            inserter.add_rows(summary_data)
+            inserter.execute()
+
+logging.info(f"Hyper file created: {hyper_file}")
+logging.info("Script completed.")
